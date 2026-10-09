@@ -441,13 +441,26 @@ struct ContentView: View {
         logger.log("Starting full handshake...", phase: "P1")
 
         do {
-            let client = LockdownClient(pairingRecord: record)
+            var client = LockdownClient(pairingRecord: record)
             try client.connect()
-            lockdownClient = client
-            logger.log("TCP connected", phase: "P1", level: .success)
+            logger.log("TCP connected (local \(client.localAddress) -> 10.7.0.1:62078)", phase: "P1", level: .success)
 
-            let type = try client.queryType()
-            logger.log("QueryType: \(type)", phase: "P1", level: .success)
+            do {
+                let type = try client.queryType()
+                logger.log("QueryType: \(type)", phase: "P1", level: .success)
+            } catch {
+                // Seen on iOS 26.6.2: lockdownd resets the VPN-loopback connection on QueryType,
+                // while idevice (StikDebug) works — it sends GetValue first. Retry the same way.
+                logger.log("QueryType failed (\(error.localizedDescription)); retrying with GetValue",
+                           phase: "P1", level: .warning)
+                client.disconnect()
+                client = LockdownClient(pairingRecord: record)
+                try client.connect()
+                logger.log("TCP reconnected (local \(client.localAddress))", phase: "P1")
+                let version = try client.getValueBeforeSession(key: "ProductVersion")
+                logger.log("GetValue ProductVersion: \(version ?? "nil")", phase: "P1", level: .success)
+            }
+            lockdownClient = client
 
             let sid = try client.startSession()
             logger.log("Session started (ID: \(sid))", phase: "P1", level: .success)

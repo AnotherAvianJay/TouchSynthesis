@@ -16,6 +16,8 @@ class LockdownClient {
     private var sessionID: String?
     private(set) var isConnected = false
     private(set) var isTLSActive = false
+    /// Local end of the socket (shows whether the connection actually went through the VPN utun).
+    private(set) var localAddress = "?"
 
     init(host: String = "10.7.0.1", port: UInt16 = 62078, pairingRecord: PairingRecord) {
         self.host = host
@@ -68,6 +70,18 @@ class LockdownClient {
         }
 
         isConnected = true
+
+        var local = sockaddr_in()
+        var localLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let gotName = withUnsafeMutablePointer(to: &local) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(socketFD, $0, &localLen) }
+        }
+        if gotName == 0 {
+            var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            var addr = local.sin_addr
+            inet_ntop(AF_INET, &addr, &buf, socklen_t(INET_ADDRSTRLEN))
+            localAddress = "\(String(cString: buf)):\(UInt16(bigEndian: local.sin_port))"
+        }
     }
 
     func disconnect() {
@@ -102,6 +116,17 @@ class LockdownClient {
             throw LockdownError.unexpectedResponse("No 'Type' in QueryType response")
         }
         return type
+    }
+
+    /// GetValue before StartSession — what idevice (StikDebug/SideStore) sends first.
+    func getValueBeforeSession(key: String) throws -> Any? {
+        try sendPlist(["Label": label, "Request": "GetValue", "Key": key])
+        let response = try receivePlist()
+
+        if let error = response["Error"] as? String {
+            throw LockdownError.serviceError(error)
+        }
+        return response["Value"]
     }
 
     func startSession() throws -> String {
