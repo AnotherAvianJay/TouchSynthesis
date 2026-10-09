@@ -1,8 +1,8 @@
 diff --git a/ffi/src/lib.rs b/ffi/src/lib.rs
-index f93806a..a64b912 100644
+index 6e818c2..69afe8e 100644
 --- a/ffi/src/lib.rs
 +++ b/ffi/src/lib.rs
-@@ -385,6 +385,86 @@ pub unsafe extern "C" fn idevice_free(idevice: *mut IdeviceHandle) {
+@@ -446,6 +446,86 @@ pub unsafe extern "C" fn idevice_free(idevice: *mut IdeviceHandle) {
      }
  }
  

@@ -7,25 +7,28 @@
 @end
 
 // ============================================================
-// Architecture (matching StikDebug):
+// Architecture (iOS 26.6+, matching StikDebug 3.1.13):
 //
-// 1. A lockdownd heartbeat (marco/polo) runs on a background thread
-//    to keep the lockdownd connection alive and prevent DDI unmount.
+// iOS 26.6 resets lockdownd (62078) connections that arrive through the
+// loopback VPN, so the old "lockdownd heartbeat + CoreDeviceProxy" path no
+// longer works on-device. Instead we open ONE RemotePairing tunnel to the
+// pairing port (49152) with `tunnel_create_rppairing`. It pair-verifies with
+// the RP keys in the pairing file (public_key / private_key / identifier, as
+// written by iloader) and hands back a TCP adapter plus an RSD handshake.
 //
-// 2. Each operation (screenshot, proxy, ping) creates a FRESH CDTunnel
-//    (provider -> CoreDeviceProxy -> adapter -> RSD), does its work,
-//    and tears everything down immediately.
-//
-// 3. The CDTunnel has a ~10s idle timeout and CANNOT be held open.
+// Every operation (screenshot, proxy) opens its own stream on that shared
+// adapter. Re-creating the tunnel per operation is avoided on purpose: a new
+// RemotePairing tunnel for the same host identity can tear down the old one,
+// which would kill the long-lived testmanagerd proxies.
 // ============================================================
+
+static const uint16_t kRemotePairingPort = 49152;
 
 /// Tracks one running proxy bridge (local TCP <-> ReadWriteOpaque stream).
 @interface _ProxyBridge : NSObject
 @property (nonatomic, assign) int serverFD;
 @property (nonatomic, assign) int clientFD;
 @property (nonatomic, assign) uint16_t localPort;
-@property (nonatomic, assign) struct AdapterHandle *adapter;
-@property (nonatomic, assign) struct RsdHandshakeHandle *handshake;
 @property (nonatomic, assign) struct ReadWriteOpaque *stream;
 @property (nonatomic, assign) BOOL running;
 @end
@@ -39,150 +42,81 @@
     if (_clientFD > 0) { close(_clientFD); _clientFD = -1; }
     if (_serverFD > 0) { close(_serverFD); _serverFD = -1; }
     if (_stream) { idevice_stream_free(_stream); _stream = NULL; }
-    if (_handshake) { rsd_handshake_free(_handshake); _handshake = NULL; }
-    if (_adapter) { adapter_free(_adapter); _adapter = NULL; }
 }
 @end
 
 @implementation IdeviceTunnel {
-    // Lockdownd heartbeat (marco/polo)
-    struct IdeviceProviderHandle *_heartbeatProvider;
-    struct HeartbeatClientHandle *_heartbeatClient;
-    BOOL _heartbeatRunning;
-    int _heartbeatToken;
+    // Shared RemotePairing tunnel; guarded by _tunnelLock together with the
+    // FFI calls that borrow it (they take &mut on the Rust side).
+    struct AdapterHandle *_adapter;
+    struct RsdHandshakeHandle *_handshake;
+    NSLock *_tunnelLock;
 
     // Saved connection params
     NSString *_savedPairingPath;
     NSString *_savedDeviceIP;
-    uint16_t _savedPort;
     BOOL _connected;
 
     // Active proxy bridges
     NSMutableArray<_ProxyBridge *> *_proxies;
 }
 
-static int sGlobalHeartbeatToken = 0;
+- (instancetype)init {
+    if ((self = [super init])) {
+        _tunnelLock = [NSLock new];
+    }
+    return self;
+}
 
 - (BOOL)isConnected {
     return _connected;
 }
 
+/// There is no lockdownd heartbeat any more; the RemotePairing tunnel is the keepalive.
 - (BOOL)heartbeatRunning {
-    return _heartbeatRunning;
+    return _connected && _adapter != NULL;
 }
 
-// MARK: - Connect (starts heartbeat only)
+// MARK: - Connect (opens the shared RemotePairing tunnel)
 
 - (nullable NSString *)connectWithPairingFile:(NSString *)pairingFilePath
                                      deviceIP:(NSString *)deviceIP
                                          port:(uint16_t)port {
-    _savedPairingPath = [pairingFilePath copy];
-    _savedDeviceIP = [deviceIP copy];
-    _savedPort = port;
-
+    (void)port;  // lockdownd's port is unused now; the tunnel goes through RemotePairing on 49152
     [self disconnect];
 
-    // Start lockdownd heartbeat — this keeps lockdownd alive and DDI mounted
-    struct IdevicePairingFile *pairing = NULL;
-    IdeviceFfiError *err = idevice_pairing_file_read([pairingFilePath UTF8String], &pairing);
-    if (err != NULL) {
-        NSString *msg = [NSString stringWithFormat:@"Pairing file read failed: %s", err->message];
-        idevice_error_free(err);
-        return msg;
+    _savedPairingPath = [pairingFilePath copy];
+    _savedDeviceIP = [deviceIP copy];
+
+    [_tunnelLock lock];
+    NSString *err = [self _openTunnelLocked];
+    [_tunnelLock unlock];
+    if (err != nil) {
+        return err;
     }
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, [deviceIP UTF8String], &addr.sin_addr) != 1) {
-        idevice_pairing_file_free(pairing);
-        return @"Invalid device IP address";
-    }
-
-    err = idevice_tcp_provider_new(
-        (struct sockaddr *)&addr,
-        pairing,  // consumed
-        "TouchSynthesis-Heartbeat",
-        &_heartbeatProvider
-    );
-    if (err != NULL) {
-        NSString *msg = [NSString stringWithFormat:@"TCP provider failed: %s", err->message];
-        idevice_error_free(err);
-        return msg;
-    }
-
-    // Connect to lockdownd heartbeat service
-    err = heartbeat_connect(_heartbeatProvider, &_heartbeatClient);
-    if (err != NULL) {
-        NSString *msg = [NSString stringWithFormat:@"Heartbeat connect failed: %s", err->message];
-        idevice_error_free(err);
-        idevice_provider_free(_heartbeatProvider);
-        _heartbeatProvider = NULL;
-        return msg;
-    }
-
-    // Start marco/polo loop on background thread
-    _heartbeatRunning = YES;
-    sGlobalHeartbeatToken++;
-    _heartbeatToken = sGlobalHeartbeatToken;
     _connected = YES;
-
-    int myToken = _heartbeatToken;
-    struct HeartbeatClientHandle *client = _heartbeatClient;
-
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-        uint64_t interval = 15;
-        NSLog(@"[IdeviceTunnel] Heartbeat thread started (token=%d)", myToken);
-
-        while (1) {
-            uint64_t newInterval = 0;
-            IdeviceFfiError *hbErr = heartbeat_get_marco(client, interval, &newInterval);
-            if (hbErr != NULL) {
-                NSLog(@"[IdeviceTunnel] Heartbeat marco failed: %s", hbErr->message);
-                idevice_error_free(hbErr);
-                break;
-            }
-
-            if (myToken != sGlobalHeartbeatToken) {
-                NSLog(@"[IdeviceTunnel] Heartbeat token expired, exiting");
-                break;
-            }
-
-            interval = newInterval + 5;
-
-            hbErr = heartbeat_send_polo(client);
-            if (hbErr != NULL) {
-                NSLog(@"[IdeviceTunnel] Heartbeat polo failed: %s", hbErr->message);
-                idevice_error_free(hbErr);
-                break;
-            }
-
-            NSLog(@"[IdeviceTunnel] Heartbeat polo (next=%llu)", interval);
-        }
-
-        NSLog(@"[IdeviceTunnel] Heartbeat thread exiting (token=%d)", myToken);
-    });
-
-    return nil; // success
+    return nil;
 }
 
-// MARK: - Fresh CDTunnel helper
+// MARK: - Shared tunnel
 
-/// Creates a fresh CDTunnel + adapter + RSD handshake.
-/// Caller must free adapter and handshake when done.
+/// Opens the RemotePairing tunnel if it isn't open yet. Call with _tunnelLock held.
 /// Returns nil on success, or an error string.
-- (nullable NSString *)_freshTunnelWithAdapter:(struct AdapterHandle **)outAdapter
-                                     handshake:(struct RsdHandshakeHandle **)outHandshake {
-    if (!_connected || !_savedPairingPath || !_savedDeviceIP) {
+- (nullable NSString *)_openTunnelLocked {
+    if (_adapter != NULL && _handshake != NULL) {
+        return nil;
+    }
+    if (!_savedPairingPath || !_savedDeviceIP) {
         return @"Not connected — call connect first";
     }
 
-    // Read pairing file (fresh copy each time)
-    struct IdevicePairingFile *pairing = NULL;
-    IdeviceFfiError *err = idevice_pairing_file_read([_savedPairingPath UTF8String], &pairing);
+    struct RpPairingFileHandle *pairing = NULL;
+    IdeviceFfiError *err = rp_pairing_file_read([_savedPairingPath UTF8String], &pairing);
     if (err != NULL) {
-        NSString *msg = [NSString stringWithFormat:@"Pairing read: %s", err->message];
+        NSString *msg = [NSString stringWithFormat:
+            @"RP pairing file read failed: %s (the file needs public_key/private_key/identifier — "
+            @"import the pairing file StikDebug uses)", err->message];
         idevice_error_free(err);
         return msg;
     }
@@ -190,95 +124,70 @@ static int sGlobalHeartbeatToken = 0;
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(_savedPort);
-    inet_pton(AF_INET, [_savedDeviceIP UTF8String], &addr.sin_addr);
-
-    struct IdeviceProviderHandle *provider = NULL;
-    err = idevice_tcp_provider_new(
-        (struct sockaddr *)&addr,
-        pairing,  // consumed
-        "TouchSynthesis-Op",
-        &provider
-    );
-    if (err != NULL) {
-        NSString *msg = [NSString stringWithFormat:@"Provider: %s", err->message];
-        idevice_error_free(err);
-        return msg;
+    addr.sin_port = htons(kRemotePairingPort);
+    if (inet_pton(AF_INET, [_savedDeviceIP UTF8String], &addr.sin_addr) != 1) {
+        rp_pairing_file_free(pairing);
+        return @"Invalid device IP address";
     }
 
-    // CoreDeviceProxy connect
-    struct CoreDeviceProxyHandle *coreDevice = NULL;
-    err = core_device_proxy_connect(provider, &coreDevice);
-    idevice_provider_free(provider);
-    if (err != NULL) {
-        NSString *msg = [NSString stringWithFormat:@"CoreDeviceProxy: %s", err->message];
-        idevice_error_free(err);
-        return msg;
-    }
-
-    // Get RSD port
-    uint16_t rsdPort = 0;
-    err = core_device_proxy_get_server_rsd_port(coreDevice, &rsdPort);
-    if (err != NULL) {
-        NSString *msg = [NSString stringWithFormat:@"RSD port: %s", err->message];
-        idevice_error_free(err);
-        core_device_proxy_free(coreDevice);
-        return msg;
-    }
-
-    // Create adapter (CONSUMES coreDevice)
     struct AdapterHandle *adapter = NULL;
-    err = core_device_proxy_create_tcp_adapter(coreDevice, &adapter);
-    if (err != NULL) {
-        NSString *msg = [NSString stringWithFormat:@"Adapter: %s", err->message];
-        idevice_error_free(err);
-        return msg;
-    }
-
-    // Connect to RSD
-    struct ReadWriteOpaque *rsdStream = NULL;
-    err = adapter_connect(adapter, rsdPort, &rsdStream);
-    if (err != NULL) {
-        NSString *msg = [NSString stringWithFormat:@"RSD connect: %s", err->message];
-        idevice_error_free(err);
-        adapter_free(adapter);
-        return msg;
-    }
-
-    // RSD handshake (CONSUMES rsdStream)
     struct RsdHandshakeHandle *handshake = NULL;
-    err = rsd_handshake_new(rsdStream, &handshake);
+    err = tunnel_create_rppairing((const idevice_sockaddr *)&addr,
+                                  (idevice_socklen_t)sizeof(addr),
+                                  "TouchSynthesis",
+                                  pairing,  // borrowed
+                                  NULL, NULL,  // no PIN: pair-setup can't run here, pair-verify must succeed
+                                  &adapter,
+                                  &handshake);
+    rp_pairing_file_free(pairing);
     if (err != NULL) {
-        NSString *msg = [NSString stringWithFormat:@"RSD handshake: %s", err->message];
+        NSString *msg = [NSString stringWithFormat:@"RemotePairing tunnel to %@:%u failed: %s",
+                         _savedDeviceIP, kRemotePairingPort, err->message];
         idevice_error_free(err);
-        adapter_free(adapter);
         return msg;
     }
 
-    *outAdapter = adapter;
-    *outHandshake = handshake;
+    _adapter = adapter;
+    _handshake = handshake;
+    NSLog(@"[IdeviceTunnel] RemotePairing tunnel up (%@:%u)", _savedDeviceIP, kRemotePairingPort);
     return nil;
+}
+
+/// Frees the shared tunnel. Call with _tunnelLock held.
+- (void)_closeTunnelLocked {
+    if (_handshake) { rsd_handshake_free(_handshake); _handshake = NULL; }
+    if (_adapter) { adapter_free(_adapter); _adapter = NULL; }
+}
+
+/// After a failed operation, drop the tunnel so the next one reconnects —
+/// but only when no proxy is still streaming through it.
+- (void)_dropTunnelIfIdle {
+    for (_ProxyBridge *bridge in _proxies) {
+        if (bridge.running) return;
+    }
+    [_tunnelLock lock];
+    [self _closeTunnelLocked];
+    [_tunnelLock unlock];
 }
 
 // MARK: - Screenshot
 
 - (nullable NSData *)takeScreenshotAndReturnError:(NSString *_Nullable *_Nullable)outError {
-    struct AdapterHandle *adapter = NULL;
-    struct RsdHandshakeHandle *handshake = NULL;
-    NSString *tunnelErr = [self _freshTunnelWithAdapter:&adapter handshake:&handshake];
+    // Create RemoteServer on the shared tunnel
+    [_tunnelLock lock];
+    NSString *tunnelErr = [self _openTunnelLocked];
     if (tunnelErr != nil) {
+        [_tunnelLock unlock];
         if (outError) *outError = tunnelErr;
         return nil;
     }
-
-    // Create RemoteServer
     struct RemoteServerHandle *remoteServer = NULL;
-    IdeviceFfiError *err = remote_server_connect_rsd(adapter, handshake, &remoteServer);
+    IdeviceFfiError *err = remote_server_connect_rsd(_adapter, _handshake, &remoteServer);
+    [_tunnelLock unlock];
     if (err != NULL) {
         if (outError) *outError = [NSString stringWithFormat:@"RemoteServer: %s", err->message];
         idevice_error_free(err);
-        rsd_handshake_free(handshake);
-        adapter_free(adapter);
+        [self _dropTunnelIfIdle];
         return nil;
     }
 
@@ -289,8 +198,6 @@ static int sGlobalHeartbeatToken = 0;
         if (outError) *outError = [NSString stringWithFormat:@"ScreenshotClient: %s", err->message];
         idevice_error_free(err);
         remote_server_free(remoteServer);
-        rsd_handshake_free(handshake);
-        adapter_free(adapter);
         return nil;
     }
 
@@ -303,8 +210,6 @@ static int sGlobalHeartbeatToken = 0;
         idevice_error_free(err);
         screenshot_client_free(ssClient);
         remote_server_free(remoteServer);
-        rsd_handshake_free(handshake);
-        adapter_free(adapter);
         return nil;
     }
 
@@ -315,11 +220,9 @@ static int sGlobalHeartbeatToken = 0;
         idevice_data_free(pngData, pngLen);
     }
 
-    // Cleanup
+    // Cleanup (the tunnel itself stays up)
     screenshot_client_free(ssClient);
     remote_server_free(remoteServer);
-    rsd_handshake_free(handshake);
-    adapter_free(adapter);
 
     if (result == nil && outError) {
         *outError = @"Screenshot returned empty data";
@@ -333,23 +236,21 @@ static int sGlobalHeartbeatToken = 0;
                               error:(NSString *_Nullable *_Nullable)outError {
     if (!_proxies) _proxies = [NSMutableArray new];
 
-    // Step 1: Create fresh CDTunnel
-    struct AdapterHandle *adapter = NULL;
-    struct RsdHandshakeHandle *handshake = NULL;
-    NSString *tunnelErr = [self _freshTunnelWithAdapter:&adapter handshake:&handshake];
+    // Step 1-3: find the service via RSD and open a stream to it on the shared tunnel
+    [_tunnelLock lock];
+    NSString *tunnelErr = [self _openTunnelLocked];
     if (tunnelErr != nil) {
+        [_tunnelLock unlock];
         if (outError) *outError = tunnelErr;
         return 0;
     }
 
-    // Step 2: Find service port via RSD
     struct CRsdService *svcInfo = NULL;
-    IdeviceFfiError *err = rsd_get_service_info(handshake, [serviceName UTF8String], &svcInfo);
+    IdeviceFfiError *err = rsd_get_service_info(_handshake, [serviceName UTF8String], &svcInfo);
     if (err != NULL) {
+        [_tunnelLock unlock];
         if (outError) *outError = [NSString stringWithFormat:@"RSD service '%@': %s", serviceName, err->message];
         idevice_error_free(err);
-        rsd_handshake_free(handshake);
-        adapter_free(adapter);
         return 0;
     }
 
@@ -357,14 +258,13 @@ static int sGlobalHeartbeatToken = 0;
     NSLog(@"[Proxy] Found %@ on port %u", serviceName, servicePort);
     rsd_free_service(svcInfo);
 
-    // Step 3: Connect to the service port via adapter
     struct ReadWriteOpaque *stream = NULL;
-    err = adapter_connect(adapter, servicePort, &stream);
+    err = adapter_connect(_adapter, servicePort, &stream);
+    [_tunnelLock unlock];
     if (err != NULL) {
         if (outError) *outError = [NSString stringWithFormat:@"adapter_connect to port %u: %s", servicePort, err->message];
         idevice_error_free(err);
-        rsd_handshake_free(handshake);
-        adapter_free(adapter);
+        [self _dropTunnelIfIdle];
         return 0;
     }
 
@@ -373,8 +273,6 @@ static int sGlobalHeartbeatToken = 0;
     if (serverFD < 0) {
         if (outError) *outError = @"socket() failed for local proxy";
         idevice_stream_free(stream);
-        rsd_handshake_free(handshake);
-        adapter_free(adapter);
         return 0;
     }
 
@@ -391,8 +289,6 @@ static int sGlobalHeartbeatToken = 0;
         if (outError) *outError = [NSString stringWithFormat:@"bind() failed: errno=%d", errno];
         close(serverFD);
         idevice_stream_free(stream);
-        rsd_handshake_free(handshake);
-        adapter_free(adapter);
         return 0;
     }
 
@@ -400,8 +296,6 @@ static int sGlobalHeartbeatToken = 0;
         if (outError) *outError = [NSString stringWithFormat:@"listen() failed: errno=%d", errno];
         close(serverFD);
         idevice_stream_free(stream);
-        rsd_handshake_free(handshake);
-        adapter_free(adapter);
         return 0;
     }
 
@@ -418,8 +312,6 @@ static int sGlobalHeartbeatToken = 0;
     bridge.serverFD = serverFD;
     bridge.clientFD = -1;
     bridge.localPort = localPort;
-    bridge.adapter = adapter;
-    bridge.handshake = handshake;
     bridge.stream = stream;
     bridge.running = YES;
     [_proxies addObject:bridge];
@@ -507,39 +399,25 @@ static int sGlobalHeartbeatToken = 0;
     [_proxies removeAllObjects];
 }
 
+/// Cheap reachability check for the UI. Opening a fresh RemotePairing tunnel
+/// here (like the old CDTunnel ping did) would tear down the shared one.
 - (BOOL)pingTunnel {
     if (!_connected) return NO;
-
-    struct AdapterHandle *adapter = NULL;
-    struct RsdHandshakeHandle *handshake = NULL;
-    NSString *err = [self _freshTunnelWithAdapter:&adapter handshake:&handshake];
-    if (err != nil) return NO;
-
-    // Successfully created a fresh tunnel — tear it down
-    rsd_handshake_free(handshake);
-    adapter_free(adapter);
-    return YES;
+    [_tunnelLock lock];
+    NSString *err = [self _openTunnelLocked];
+    [_tunnelLock unlock];
+    return err == nil;
 }
 
 // MARK: - Disconnect
 
 - (void)disconnect {
-    // Stop proxies
+    // Stop proxies first: their streams live on the shared adapter
     [self stopAllProxies];
 
-    // Stop heartbeat
-    if (_heartbeatRunning) {
-        sGlobalHeartbeatToken++;
-        _heartbeatRunning = NO;
-    }
-    if (_heartbeatClient) {
-        heartbeat_client_free(_heartbeatClient);
-        _heartbeatClient = NULL;
-    }
-    if (_heartbeatProvider) {
-        idevice_provider_free(_heartbeatProvider);
-        _heartbeatProvider = NULL;
-    }
+    [_tunnelLock lock];
+    [self _closeTunnelLocked];
+    [_tunnelLock unlock];
     _connected = NO;
 }
 

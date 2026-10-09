@@ -465,8 +465,8 @@ struct ContentView: View {
         }
 
         // Step 2: Tunnel + heartbeat
-        status = "Starting tunnel & heartbeat..."
-        logger.log("Starting lockdownd heartbeat...", phase: "P3")
+        status = "Starting RemotePairing tunnel..."
+        logger.log("Creating RemotePairing tunnel (10.7.0.1:49152)...", phase: "P3")
 
         let docsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let pairingPath = docsDir.appendingPathComponent("pairing.plist").path
@@ -480,14 +480,14 @@ struct ContentView: View {
         if let errorMsg = errorMsg {
             status = "Tunnel failed: \(errorMsg)"
             logger.log("Connect failed: \(errorMsg)", phase: "P3", level: .error)
-            logger.log("Is DDI mounted? Use StikDebug to mount it first.", phase: "P3", level: .warning)
+            logger.log("Is LocalDevVPN on, and does StikDebug connect with this same pairing file?", phase: "P3", level: .warning)
             return
         }
 
         ideviceTunnel = tunnel
         tunnelConnected = true
-        logger.log("Lockdownd heartbeat started (marco/polo)", phase: "P3", level: .success)
-        logger.log("Each operation will create a fresh CDTunnel on demand", phase: "P3", level: .info)
+        logger.log("RemotePairing tunnel up", phase: "P3", level: .success)
+        logger.log("Screenshots and testmanagerd proxies share this tunnel", phase: "P3", level: .info)
 
         BackgroundKeepAlive.shared.start()
         keepAliveActive = BackgroundKeepAlive.shared.isActive
