@@ -118,17 +118,6 @@ class LockdownClient {
         return type
     }
 
-    /// GetValue before StartSession — what idevice (StikDebug/SideStore) sends first.
-    func getValueBeforeSession(key: String) throws -> Any? {
-        try sendPlist(["Label": label, "Request": "GetValue", "Key": key])
-        let response = try receivePlist()
-
-        if let error = response["Error"] as? String {
-            throw LockdownError.serviceError(error)
-        }
-        return response["Value"]
-    }
-
     func startSession() throws -> String {
         let request: [String: Any] = [
             "Label": label,

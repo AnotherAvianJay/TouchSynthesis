@@ -440,26 +440,17 @@ struct ContentView: View {
         status = "Connecting lockdown..."
         logger.log("Starting full handshake...", phase: "P1")
 
+        // This Swift handshake is only a pre-flight check: nothing after it uses `lockdownClient`.
+        // On iOS 26.6.2 lockdownd resets these plain-socket connections (errno 54) even though
+        // the idevice (Rust) client used in step 2 — same one StikDebug uses — works fine.
+        // So a failure here is logged and we carry on.
         do {
-            var client = LockdownClient(pairingRecord: record)
+            let client = LockdownClient(pairingRecord: record)
             try client.connect()
             logger.log("TCP connected (local \(client.localAddress) -> 10.7.0.1:62078)", phase: "P1", level: .success)
 
-            do {
-                let type = try client.queryType()
-                logger.log("QueryType: \(type)", phase: "P1", level: .success)
-            } catch {
-                // Seen on iOS 26.6.2: lockdownd resets the VPN-loopback connection on QueryType,
-                // while idevice (StikDebug) works — it sends GetValue first. Retry the same way.
-                logger.log("QueryType failed (\(error.localizedDescription)); retrying with GetValue",
-                           phase: "P1", level: .warning)
-                client.disconnect()
-                client = LockdownClient(pairingRecord: record)
-                try client.connect()
-                logger.log("TCP reconnected (local \(client.localAddress))", phase: "P1")
-                let version = try client.getValueBeforeSession(key: "ProductVersion")
-                logger.log("GetValue ProductVersion: \(version ?? "nil")", phase: "P1", level: .success)
-            }
+            let type = try client.queryType()
+            logger.log("QueryType: \(type)", phase: "P1", level: .success)
             lockdownClient = client
 
             let sid = try client.startSession()
@@ -467,12 +458,10 @@ struct ContentView: View {
             logger.log("TLS active: \(client.isTLSActive)", phase: "P1",
                        level: client.isTLSActive ? .success : .warning)
         } catch {
-            status = "Handshake failed: \(error.localizedDescription)"
-            logger.log("Handshake failed: \(error.localizedDescription)", phase: "P1", level: .error)
-            if let recovery = (error as? LockdownError)?.recoverySuggestion {
-                logger.log("Fix: \(recovery)", phase: "P1", level: .warning)
-            }
-            return
+            logger.log("Swift lockdown handshake failed (\(error.localizedDescription)); continuing with idevice",
+                       phase: "P1", level: .warning)
+            lockdownClient?.disconnect()
+            lockdownClient = nil
         }
 
         // Step 2: Tunnel + heartbeat
@@ -516,13 +505,19 @@ struct ContentView: View {
         logger.log("Starting self-runner mode...", phase: "RUNNER", level: .info)
 
         do {
-            let lockdown = LockdownClient(pairingRecord: record)
-            try lockdown.connect()
-            logger.log("Lockdown TCP connected (for testmanagerd)", phase: "RUNNER", level: .success)
-
-            let _ = try lockdown.queryType()
-            let sid = try lockdown.startSession()
-            logger.log("Lockdown session: \(sid)", phase: "RUNNER", level: .success)
+            // Only needed for the legacy lockdownd testmanagerd services; iOS 26 uses RSD via idevice.
+            var lockdown: LockdownClient? = LockdownClient(pairingRecord: record)
+            do {
+                try lockdown!.connect()
+                let _ = try lockdown!.queryType()
+                let sid = try lockdown!.startSession()
+                logger.log("Lockdown session: \(sid)", phase: "RUNNER", level: .success)
+            } catch {
+                logger.log("Lockdown session unavailable (\(error.localizedDescription)); using RSD only",
+                           phase: "RUNNER", level: .warning)
+                lockdown?.disconnect()
+                lockdown = nil
+            }
 
             let tm = TestManagerClient(lockdown: lockdown, tunnel: ideviceTunnel, logger: logger)
             testManager = tm

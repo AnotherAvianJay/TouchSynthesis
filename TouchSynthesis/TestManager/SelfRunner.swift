@@ -6,12 +6,12 @@ import Foundation
 /// the IDE (via DTX to testmanagerd) and the runner (via XCTest dlopen).
 /// This bypasses AMFI environment variable stripping on iOS 26+.
 class SelfRunner {
-    let lockdown: LockdownClient
+    let lockdown: LockdownClient?
     let testManager: TestManagerClient
     let tunnel: IdeviceTunnel?
     let logger: ProtocolLogger?
 
-    init(lockdown: LockdownClient, testManager: TestManagerClient,
+    init(lockdown: LockdownClient?, testManager: TestManagerClient,
          tunnel: IdeviceTunnel? = nil, logger: ProtocolLogger? = nil) {
         self.lockdown = lockdown
         self.testManager = testManager

@@ -4,7 +4,8 @@ import Foundation
 /// Implements the DTX-based RPC protocol to manage XCTest sessions
 /// for touch event synthesis via the self-runner approach.
 class TestManagerClient {
-    let lockdown: LockdownClient
+    /// nil when the plain lockdownd handshake is refused (iOS 26.6+); then only the RSD path is used.
+    let lockdown: LockdownClient?
     let tunnel: IdeviceTunnel?  // Optional: for RSD proxy path
     let logger: ProtocolLogger?
 
@@ -35,7 +36,7 @@ class TestManagerClient {
     private var testBundleReadyContinuation: CheckedContinuation<Void, Error>?
     private var testPlanStartedContinuation: CheckedContinuation<Void, Error>?
 
-    init(lockdown: LockdownClient, tunnel: IdeviceTunnel? = nil, logger: ProtocolLogger? = nil) {
+    init(lockdown: LockdownClient?, tunnel: IdeviceTunnel? = nil, logger: ProtocolLogger? = nil) {
         self.lockdown = lockdown
         self.tunnel = tunnel
         self.logger = logger
@@ -54,7 +55,11 @@ class TestManagerClient {
         var useRSD = false
 
         var lastError: String = ""
+        if lockdown == nil {
+            log("No lockdown session; skipping lockdownd services, using RSD", level: .info)
+        }
         for serviceName in Self.serviceNames {
+            guard let lockdown else { break }
             do {
                 log("Trying lockdown service: \(serviceName)", level: .debug)
                 let (p1, s1) = try lockdown.startService(name: serviceName)
@@ -129,13 +134,13 @@ class TestManagerClient {
         }
 
         // Create DTX connections
-        let host = useRSD ? "127.0.0.1" : lockdown.host
+        let host = useRSD ? "127.0.0.1" : (lockdown?.host ?? "10.7.0.1")
         conn1 = DTXConnection(
             host: host, port: servicePort1,
-            useTLS: serviceSSL1, pairingRecord: useRSD ? nil : lockdown.pairingRecord)
+            useTLS: serviceSSL1, pairingRecord: useRSD ? nil : lockdown?.pairingRecord)
         conn2 = DTXConnection(
             host: host, port: servicePort2,
-            useTLS: serviceSSL2, pairingRecord: useRSD ? nil : lockdown.pairingRecord)
+            useTLS: serviceSSL2, pairingRecord: useRSD ? nil : lockdown?.pairingRecord)
 
         // Wait a moment for proxy accept threads
         if useRSD {
