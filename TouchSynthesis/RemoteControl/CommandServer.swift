@@ -277,7 +277,42 @@ class CommandServer: ObservableObject {
             return CommandResponse(id: cmd.id, success: true)
 
         case "screenshot":
+            // The XCTest path doesn't touch the tunnel, so it can't wedge screenshotQueue the way a
+            // hung DVT screenshot does (which also starved the stream).
+            if TouchSynthesizer.isLoaded {
+                let quality = CGFloat(cmd.params?["quality"]?.doubleValue ?? 0.8)
+                let shot: (String?, String?) = await awaitOnce(timeout: 15, fallback: (nil, "screenshot timed out")) { done in
+                    TouchSynthesizer.takeScreenshot(withQuality: quality) { data, error in
+                        done((data?.base64EncodedString(), error))
+                    }
+                }
+                if let b64 = shot.0 { return CommandResponse(id: cmd.id, success: true, data: b64) }
+                return CommandResponse(id: cmd.id, success: false, error: shot.1 ?? "XCTest screenshot failed")
+            }
             return await takeScreenshot(id: cmd.id)
+
+        case "launchApp":
+            let bundleID = cmd.params?["bundleId"]?.stringValue ?? ""
+            let error: String? = await awaitOnce(timeout: 30, fallback: "activate timed out") { done in
+                TouchSynthesizer.activateApplication(bundleID) { done($0) }
+            }
+            return CommandResponse(id: cmd.id, success: error == nil, error: error)
+
+        case "tree":
+            let bundleID = cmd.params?["bundleId"]?.stringValue ?? ""
+            let tree: (String?, String?) = await awaitOnce(timeout: 30, fallback: (nil, "snapshot timed out")) { done in
+                TouchSynthesizer.snapshotApplication(bundleID) { dict, error in
+                    guard let dict,
+                          let json = try? JSONSerialization.data(withJSONObject: dict),
+                          let text = String(data: json, encoding: .utf8) else {
+                        done((nil, error ?? "snapshot not serializable"))
+                        return
+                    }
+                    done((text, nil))
+                }
+            }
+            if let text = tree.0 { return CommandResponse(id: cmd.id, success: true, data: text) }
+            return CommandResponse(id: cmd.id, success: false, error: tree.1)
 
         case "startStream":
             let quality = cmd.params?["quality"]?.doubleValue ?? 0.3
@@ -508,6 +543,20 @@ class CommandServer: ObservableObject {
 
     // MARK: - Helpers
 
+    /// Bridges an XCTest callback into async: resumes exactly once, even if the callback fires
+    /// twice or never (then `fallback` is returned after `timeout` seconds).
+    private func awaitOnce<T>(timeout: TimeInterval, fallback: T,
+                              _ start: (@escaping (T) -> Void) -> Void) async -> T {
+        await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
+            let flag = OnceFlag()
+            let finish: (T) -> Void = { value in
+                if flag.claim() { continuation.resume(returning: value) }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { finish(fallback) }
+            start(finish)
+        }
+    }
+
     /// Fire-and-forget: runs the synthesis block in the background, logs errors but doesn't block the caller.
     private func fireAndForget(id: String, _ block: @escaping (@escaping (String?) -> Void) -> Void) {
         let logger = self.logger
@@ -673,5 +722,19 @@ class ClientConnection {
         DispatchQueue.main.async { [weak self] in
             self?.onDisconnect?()
         }
+    }
+}
+
+/// Thread-safe "first caller wins" flag used by `awaitOnce`.
+private final class OnceFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if done { return false }
+        done = true
+        return true
     }
 }

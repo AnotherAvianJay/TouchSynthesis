@@ -1546,4 +1546,96 @@ static NSString *_spoofedBundleIdentifier(id self, SEL _cmd) {
     });
 }
 
+// MARK: - App activation & UI snapshots (XCUIApplication)
+
+typedef void (*TS_MsgSend_void)(id, SEL);
+typedef id (*TS_MsgSend_id_errptr)(id, SEL, NSError **);
+
+/// Converts snapshot values into types NSJSONSerialization accepts.
+static id _TSJSONSafe(id obj) {
+    if (obj == nil || obj == [NSNull null]) return [NSNull null];
+    if ([obj isKindOfClass:[NSString class]] || [obj isKindOfClass:[NSNumber class]]) return obj;
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *out = [NSMutableDictionary dictionary];
+        [(NSDictionary *)obj enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
+            out[[key description]] = _TSJSONSafe(value);
+        }];
+        return out;
+    }
+    if ([obj isKindOfClass:[NSArray class]]) {
+        NSMutableArray *out = [NSMutableArray array];
+        for (id value in (NSArray *)obj) [out addObject:_TSJSONSafe(value)];
+        return out;
+    }
+    if ([obj isKindOfClass:[NSValue class]] && strcmp([(NSValue *)obj objCType], @encode(CGRect)) == 0) {
+        CGRect r = [(NSValue *)obj CGRectValue];
+        return @{@"X": @(r.origin.x), @"Y": @(r.origin.y), @"Width": @(r.size.width), @"Height": @(r.size.height)};
+    }
+    return [obj description];
+}
+
++ (nullable id)_applicationWithBundleID:(NSString *)bundleID error:(NSString **)outError {
+    Class cls = NSClassFromString(@"XCUIApplication");
+    if (!cls) { *outError = @"XCUIApplication not available"; return nil; }
+    id app = ((MsgSend_id_id)objc_msgSend)([cls alloc], @selector(initWithBundleIdentifier:), bundleID);
+    if (!app) { *outError = @"XCUIApplication init returned nil"; }
+    return app;
+}
+
++ (void)activateApplication:(NSString *)bundleID
+                 completion:(void (^)(NSString *_Nullable))completion {
+    NSLog(@"[TouchSynthesizer] activateApplication: %@", bundleID);
+    if (!sFrameworkLoaded) { completion(@"Not loaded"); return; }
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        _installNonFatalAssertionHandler();
+        @try {
+            NSString *err = nil;
+            id app = [self _applicationWithBundleID:bundleID error:&err];
+            if (!app) { completion(err); return; }
+            ((TS_MsgSend_void)objc_msgSend)(app, @selector(activate));
+            sLastPathUsed = @"XCUIApplication.activate";
+            completion(nil);
+        } @catch (NSException *e) {
+            completion([NSString stringWithFormat:@"activate threw: %@", e.reason]);
+        }
+    });
+}
+
++ (void)snapshotApplication:(NSString *)bundleID
+                 completion:(void (^)(NSDictionary *_Nullable, NSString *_Nullable))completion {
+    if (!sFrameworkLoaded) { completion(nil, @"Not loaded"); return; }
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        _installNonFatalAssertionHandler();
+        @try {
+            NSString *err = nil;
+            id app = [self _applicationWithBundleID:bundleID error:&err];
+            if (!app) { completion(nil, err); return; }
+
+            SEL snapSel = @selector(snapshotWithError:);
+            if (![app respondsToSelector:snapSel]) { completion(nil, @"snapshotWithError: not available"); return; }
+            NSError *snapError = nil;
+            id snapshot = ((TS_MsgSend_id_errptr)objc_msgSend)(app, snapSel, &snapError);
+            if (!snapshot) {
+                completion(nil, snapError ? snapError.localizedDescription : @"snapshot returned nil");
+                return;
+            }
+
+            id dict = nil;
+            if ([snapshot respondsToSelector:@selector(dictionaryRepresentation)]) {
+                dict = [snapshot performSelector:@selector(dictionaryRepresentation)];
+            }
+            if (![dict isKindOfClass:[NSDictionary class]]) {
+                completion(nil, @"snapshot has no dictionaryRepresentation");
+                return;
+            }
+            sLastPathUsed = @"XCUIApplication.snapshot";
+            completion(_TSJSONSafe(dict), nil);
+        } @catch (NSException *e) {
+            completion(nil, [NSString stringWithFormat:@"snapshot threw: %@", e.reason]);
+        }
+    });
+}
+
 @end

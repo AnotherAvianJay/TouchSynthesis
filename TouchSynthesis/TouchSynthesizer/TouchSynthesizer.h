@@ -98,6 +98,15 @@ NS_ASSUME_NONNULL_BEGIN
 + (void)pressButton:(NSUInteger)button
          completion:(void (^)(NSString *_Nullable error))completion;
 
+/// Bring an app to the foreground (launching it if needed) via XCUIApplication.activate.
++ (void)activateApplication:(NSString *)bundleID
+                 completion:(void (^)(NSString *_Nullable error))completion;
+
+/// Accessibility snapshot of an app's UI (XCUIElementSnapshot.dictionaryRepresentation,
+/// converted to JSON-safe types).
++ (void)snapshotApplication:(NSString *)bundleID
+                 completion:(void (^)(NSDictionary *_Nullable tree, NSString *_Nullable error))completion;
+
 // MARK: - Multi-Point Gesture (streamed touch)
 
 /// Synthesize a gesture from accumulated streamed touch points.
