@@ -7,6 +7,13 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: write  # 發佈 release
+
+defaults:
+  run:
+    shell: bash  # 明確指定 bash 才會帶 -eo pipefail，管線裡的失敗不會被吃掉
+
 jobs:
   build:
     runs-on: macos-15
@@ -15,6 +22,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      # ContentView 用了 iOS 26 的 .glassEffect，要 Xcode 26 的 SDK
+      - name: Select Xcode 26
+        run: |
+          ls -d /Applications/Xcode*.app
+          XC=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
 
       - name: Rust iOS target
         run: rustup target add aarch64-apple-ios
@@ -35,13 +50,17 @@ jobs:
         run: |
           xcodebuild -project TouchSynthesis.xcodeproj -scheme TouchSynthesis \
             -sdk iphoneos -configuration Debug -derivedDataPath build \
+            -destination 'generic/platform=iOS' \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
-            build | tail -n 200
+            build > xcodebuild.log 2>&1 || { grep -E "error:" xcodebuild.log; tail -n 80 xcodebuild.log; exit 1; }
+          grep -E "warning: .*(will never|unavailable)" xcodebuild.log | head -20 || true
 
       - name: Package IPA
         run: |
+          APP=build/Build/Products/Debug-iphoneos/TouchSynthesis.app
+          test -f "$APP/TouchSynthesis"
           mkdir -p Payload
-          cp -R build/Build/Products/Debug-iphoneos/TouchSynthesis.app Payload/
+          cp -R "$APP" Payload/
           zip -qry TouchSynthesis.ipa Payload
           ls -lh TouchSynthesis.ipa
 
@@ -49,3 +68,13 @@ jobs:
         with:
           name: TouchSynthesis-ipa
           path: TouchSynthesis.ipa
+
+      # 固定的 latest release，iPhone 上用 Safari 下載後交給 SideStore
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest -y --cleanup-tag || true
+          gh release create latest TouchSynthesis.ipa --prerelease \
+            --title "TouchSynthesis (unsigned, ${GITHUB_SHA::7})" \
+            --notes "未簽名 IPA，用 SideStore 安裝。Built from ${GITHUB_SHA}."
