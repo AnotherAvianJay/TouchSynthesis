@@ -1,0 +1,51 @@
+# 在 GitHub 的 macOS 機器上編譯「未簽名」的 IPA，再交給 SideStore 用免費 Apple ID 簽名安裝。
+# （本機的 MacBook Pro 2015 只能跑到 Monterey / Xcode 14，編不了這個專案）
+name: build-ipa
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Rust iOS target
+        run: rustup target add aarch64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vendor/idevice
+
+      - name: Build libidevice_ffi
+        run: ./scripts/build-idevice.sh
+
+      - name: XcodeGen
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Build app (unsigned)
+        run: |
+          xcodebuild -project TouchSynthesis.xcodeproj -scheme TouchSynthesis \
+            -sdk iphoneos -configuration Debug -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
+            build | tail -n 200
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Debug-iphoneos/TouchSynthesis.app Payload/
+          zip -qry TouchSynthesis.ipa Payload
+          ls -lh TouchSynthesis.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TouchSynthesis-ipa
+          path: TouchSynthesis.ipa
