@@ -1,6 +1,9 @@
 #import "TouchSynthesizer.h"
 #import <UIKit/UIKit.h>
 #import <dlfcn.h>
+#import <errno.h>
+#import <string.h>
+#import <unistd.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach/mach_time.h>
@@ -201,21 +204,39 @@ static void _installGlobalExceptionHandler(void) {
         NULL
     };
 
+    // dlerror() only keeps the last failure, which hides why the real DDI path failed —
+    // collect every attempt, plus whether the DDI files are visible at all.
+    NSMutableArray<NSString *> *attempts = [NSMutableArray array];
+    const char *probes[] = {
+        "/System/Developer/Library/Frameworks/XCTest.framework/XCTest",
+        "/System/Developer/usr/lib/lib_TestingInterop.dylib",
+        NULL
+    };
+    for (int i = 0; probes[i] != NULL; i++) {
+        int rc = access(probes[i], R_OK);
+        [attempts addObject:[NSString stringWithFormat:@"access(%s) = %s", probes[i],
+                             rc == 0 ? "ok" : strerror(errno)]];
+    }
+
     for (int i = 0; paths[i] != NULL; i++) {
         sFrameworkHandle = dlopen(paths[i], RTLD_NOW);
         if (sFrameworkHandle) {
             NSLog(@"[TouchSynthesizer] Loaded from: %s", paths[i]);
             break;
         }
+        const char *err = dlerror();
+        [attempts addObject:[NSString stringWithFormat:@"%s -> %s", paths[i], err ? err : "unknown error"]];
     }
 
     if (!sFrameworkHandle) {
-        return [NSString stringWithFormat:@"Failed to load XCTest.framework: %s", dlerror()];
+        return [NSString stringWithFormat:@"Failed to load XCTest.framework:\n%@",
+                [attempts componentsJoinedByString:@"\n"]];
     }
 
     // Also load automation support frameworks
     const char *automationPaths[] = {
         "/System/Developer/Library/PrivateFrameworks/XCTAutomationSupport.framework/XCTAutomationSupport",
+        "/System/Developer/Library/Frameworks/XCUIAutomation.framework/XCUIAutomation",  // public in the iOS 26.4+ cryptex DDI
         "/System/Developer/Library/PrivateFrameworks/XCUIAutomation.framework/XCUIAutomation",
         "/System/Developer/Library/PrivateFrameworks/XCTestCore.framework/XCTestCore",
         NULL

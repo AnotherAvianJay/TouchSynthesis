@@ -59,6 +59,9 @@ jobs:
         run: |
           APP=build/Build/Products/Debug-iphoneos/TouchSynthesis.app
           test -f "$APP/TouchSynthesis"
+          for bin in "$APP/TouchSynthesis" "$APP/TouchSynthesis.debug.dylib"; do
+            [ -f "$bin" ] && { echo "== rpaths of $(basename "$bin")"; otool -l "$bin" | grep -A2 LC_RPATH | grep path || true; }
+          done
           mkdir -p Payload
           cp -R "$APP" Payload/
           zip -qry TouchSynthesis.ipa Payload

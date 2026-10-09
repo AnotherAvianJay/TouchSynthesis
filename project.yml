@@ -30,6 +30,13 @@ targets:
           - "$(PROJECT_DIR)/TouchSynthesis/idevice"
         HEADER_SEARCH_PATHS:
           - "$(PROJECT_DIR)/TouchSynthesis/idevice"
+        # XCTestCore in the iOS 26.4+ cryptex DDI loads @rpath/lib_TestingInterop.dylib with
+        # rpath /usr/lib/swift, but the DDI ships it at /System/Developer/usr/lib. dyld also
+        # searches the main executable's rpaths, so add that directory here.
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/Frameworks"
+          - "/System/Developer/usr/lib"
         OTHER_LDFLAGS:
           - "-lidevice_ffi"
           - "-lSystem"
